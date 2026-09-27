@@ -1,0 +1,174 @@
+"""Правая панель статистики + нижний статус-бар."""
+from __future__ import annotations
+
+import os
+
+from rich.text import Text
+from textual.reactive import reactive
+from textual.widgets import Static
+
+
+def _short_model(name: str) -> str:
+    """Из полного пути модели — только имя файла."""
+    if not name or name == "—":
+        return "—"
+    return os.path.basename(name)
+
+
+_FILE_ICON = {
+    "create": ("+", "green"),
+    "edit":   ("~", "cyan"),
+    "delete": ("×", "red"),
+    "rename": (">", "yellow"),
+}
+
+
+class StatsPanel(Static):
+    """Правая панель: session / last turn / context / files."""
+
+    def __init__(self, **kwargs):
+        super().__init__("", **kwargs)
+        self._session: dict = {}
+        self._turn: dict = {}
+        self._ctx: dict = {"used": 0, "max": 0}
+        self._files: dict[str, str] = {}   # path → kind
+        self._tot_pt = 0
+        self._tot_ct = 0
+
+    def render(self) -> Text:
+        return self._build()
+
+    # --- публичный интерфейс -----------------------------------------
+
+    def setup(self, model: str, endpoint: str, ctx_window: int,
+              tools: list[str] | None = None) -> None:
+        self._session = {"model": model, "endpoint": endpoint,
+                         "ctx_window": ctx_window}
+        self._ctx["max"] = ctx_window
+        self.refresh()
+
+    def turn_stats(self, pt: int, ct: int, ms: int, pct: float,
+                   thinking_chars: int = 0, thinking_ms: int = 0) -> None:
+        self._turn = {"pt": pt, "ct": ct, "ms": ms,
+                      "tch": thinking_chars, "tms": thinking_ms}
+        self._ctx["used"] = pt
+        self._tot_pt += pt
+        self._tot_ct += ct
+        self.refresh()
+
+    def file_touched(self, path: str, kind: str = "edit") -> None:
+        """kind ∈ {'create', 'edit', 'delete', 'rename'}."""
+        self._files[path] = kind
+        self.refresh()
+
+    # --- совместимость (callbacks больше не зовёт, но пусть будет) ----
+
+    def tool_called(self, name: str) -> None:
+        pass
+
+    def tool_result(self, name: str, is_err: bool) -> None:
+        pass
+
+    # --- рендер ------------------------------------------------------
+
+    def _build(self) -> Text:
+        t = Text()
+
+        if self._session:
+            t.append("SESSION\n", style="bold")
+            t.append(
+                f"  model:    {_short_model(self._session['model'])}\n",
+                style="dim")
+            t.append(f"  endpoint: {self._session['endpoint']}\n",
+                     style="dim")
+            t.append(f"  context:  {self._session['ctx_window']} tok\n",
+                     style="dim")
+            t.append(f"  tokens:   {self._tot_pt + self._tot_ct} "
+                     f"(in {self._tot_pt} / out {self._tot_ct})\n\n",
+                     style="dim")
+
+        if self._turn:
+            ms = self._turn.get("ms", 0)
+            ct = self._turn.get("ct", 0)
+            speed = (ct / (ms / 1000)) if ms else 0
+            t.append("LAST TURN\n", style="bold")
+            t.append(f"  prompt:     {self._turn.get('pt', 0)} tok\n",
+                     style="dim")
+            t.append(f"  completion: {ct} tok\n", style="dim")
+            t.append(f"  latency:    {ms} ms\n", style="dim")
+            t.append(f"  speed:      {speed:.1f} tok/s\n", style="dim")
+            tch = self._turn.get("tch", 0)
+            tms = self._turn.get("tms", 0)
+            if tch:
+                t.append(f"  thinking:   {tch} chars / {tms} ms\n",
+                         style="dim")
+            t.append("\n")
+
+        if self._ctx["max"]:
+            used = self._ctx["used"]
+            total = self._ctx["max"]
+            pct = used / total if total else 0
+            bar = self._bar(pct, 1.0, 18)
+            bar_style = ("green" if pct < 0.5
+                         else ("yellow" if pct < 0.8 else "red"))
+            t.append("CONTEXT\n", style="bold")
+            t.append("  [")
+            t.append(bar, style=bar_style)
+            t.append(f"] {pct*100:5.1f}%\n", style="dim")
+            t.append(f"  {used} / {total} tok\n\n", style="dim")
+
+        if self._files:
+            t.append("FILES\n", style="bold")
+            items = sorted(self._files.items(), key=lambda kv: kv[0])
+            for path, kind in items[:12]:
+                name = os.path.basename(path) or path
+                if len(name) > 18:
+                    name = name[:17] + "…"
+                ch, style = _FILE_ICON.get(kind, ("·", "grey50"))
+                t.append(f"  {name:<19}", style="dim")
+                t.append(f" {ch}\n", style=style)
+            if len(items) > 12:
+                t.append(f"  … +{len(items) - 12} more\n",
+                         style="grey50")
+
+        return t
+
+    @staticmethod
+    def _bar(value: float, maxv: float, width: int) -> str:
+        if maxv <= 0:
+            return "░" * width
+        filled = int(round(value / maxv * width))
+        filled = max(0, min(width, filled))
+        return "█" * filled + "░" * (width - filled)
+
+
+class StatusBar(Static):
+    """Одна строка снизу: модель, индикаторы, подсказка команд."""
+
+    model = reactive("—")
+    busy = reactive(False)
+    thinking = reactive("")
+
+    def render(self) -> Text:
+        left = Text()
+        left.append(f" {_short_model(self.model)} ", style="bold")
+        if self.busy:
+            left.append("  ● busy", style="yellow")
+        if self.thinking:
+            left.append(f"  🧠 {self.thinking}", style="dim")
+
+        right = "/help · /exit "
+        try:
+            width = self.size.width
+        except Exception:
+            width = 0
+        if not width or width < len(left.plain) + len(right) + 4:
+            # узкий терминал — просто приклеим справа одним пробелом
+            left.append("  ")
+            left.append(right, style="dim")
+            return left
+
+        gap = width - len(left.plain) - len(right)
+        left.append(" " * gap)
+        left.append(right, style="dim")
+        return left

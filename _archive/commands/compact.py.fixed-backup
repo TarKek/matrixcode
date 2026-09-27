@@ -1,0 +1,17 @@
+"""Команда /compact — принудительно сжать старые tool-result'ы."""
+import main as core
+
+
+def cmd_compact(app, arg: str) -> str:
+    if not app.agent:
+        return "no agent yet"
+    n = core.compress_messages(app.agent.messages, core.KEEP_TURNS)
+    chars = sum(len(m.get("content", "")) for m in app.agent.messages)
+    if n:
+        return f"compacted {n} result(s); history now {chars} chars"
+    return "nothing to compact"
+
+
+def register(reg):
+    reg.add("/compact", "/compact — force-compress old tool results",
+            cmd_compact)
